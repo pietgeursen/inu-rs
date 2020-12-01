@@ -1,0 +1,8 @@
+[package]
+name = "inu-rs"
+version = "0.1.0"
+authors = ["Piet Geursen <pietgeursen@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+futures = "0.3.8"
