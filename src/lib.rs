@@ -1,11 +1,85 @@
-use futures::channel::mpsc::*;
+//! # inu-rs
+//! > [inu](https://github.com/ahdinosaur/inu) reduxy state manager in rust
+//!
+//! ## Example
+//!
+//! ```
+//!    use inu_rs::*;
+//!
+//!    use async_std::{stream::interval, task::block_on};
+//!    use futures::{FutureExt, Stream, StreamExt};
+//!    use std::time::Duration;
+//!    use std::pin::Pin;
+//!
+//!    #[derive(Copy, Clone, Debug)]
+//!    struct MyState {
+//!        count: i32,
+//!    }
+//!
+//!    enum MyActions {
+//!        TimerTicked,
+//!    }
+//!
+//!    enum MyEffects {
+//!        ScheduleTick(u64),
+//!    }
+//!
+//!    impl State for MyState {
+//!        type Action = MyActions;
+//!        type Effect = MyEffects;
+//!
+//!        fn apply_action(&self, action: &Self::Action) -> Self {
+//!            match action {
+//!                MyActions::TimerTicked => MyState {
+//!                    count: self.count + 1,
+//!                },
+//!            }
+//!        }
+//!        fn apply_effect(&self, effect: &Self::Effect) -> Pin<Box<dyn Stream<Item = Self::Action>>> {
+//!            match effect {
+//!                MyEffects::ScheduleTick(tick_interval) => {
+//!                    let interval = interval(Duration::from_millis(*tick_interval));
+//!                    let stream = interval.take(2).map(|_| MyActions::TimerTicked);
+//!                    Box::pin(stream)
+//!                }
+//!            }
+//!        }
+//!    }
+//!
+//!    fn main() {
+//!        block_on(async {
+//!            let initial_state = MyState { count: 0 };
+//!            let mut inu = Inu::new(initial_state);
+//!            let inu_handle = inu.get_handle();
+//!
+//!            let stopped = inu
+//!                .subscribe()
+//!                .take_while(|state| futures::future::ready(state.count < 2))
+//!                .into_future()
+//!                .then(|_| async { inu_handle.stop().await.unwrap() });
+//!
+//!            inu.dispatch(None, Some(MyEffects::ScheduleTick(1)))
+//!                .await
+//!                .unwrap();
+//!
+//!
+//!            futures::join! {inu.run(), stopped };
+//!
+//!            assert_eq!(inu.get_state().await.count, 2);
+//!        });
+//!    }
+//! ```
+//!
+pub use futures::channel::mpsc::{Sender, Receiver, UnboundedReceiver, SendError};
+use futures::channel::mpsc::{channel, unbounded, UnboundedSender};
 use futures::lock::Mutex;
-use futures::Future;
 use futures::Stream;
 use futures::{SinkExt, StreamExt};
+use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
 
+/// Implement this trait for your applications's state.  
 pub trait State {
     type Action;
     type Effect;
@@ -14,72 +88,126 @@ pub trait State {
     fn apply_effect(&self, effect: &Self::Effect) -> Pin<Box<dyn Stream<Item = Self::Action>>>;
 }
 
-pub type Subscriber<State> = Box<dyn Fn(&State) -> ()>;
-
-pub trait Redux<S: State> {
-    fn dispatch(&mut self, action: &S::Action);
-    fn get_state(&mut self) -> &S;
-    fn subscribe(&mut self, subscriber: Subscriber<S>);
+/// The handle you can use to stop an `Inu`
+pub struct Handle {
+    stopper: Sender<()>,
 }
 
+impl Handle {
+    /// Stop the `Inu` instance.
+    pub async fn stop(mut self) -> Result<(), SendError> {
+        self.stopper.send(()).await
+    }
+}
+
+/// The `Inu` state manager. 
 pub struct Inu<S: State> {
-    initial_state: S,
     state: Arc<Mutex<S>>,
+
     action_sender: UnboundedSender<S::Action>,
     action_receiver: Option<UnboundedReceiver<S::Action>>,
 
-    state_subscribers: Vec<UnboundedSender<S>>,
-
     effect_sender: UnboundedSender<S::Effect>,
     effect_receiver: Option<UnboundedReceiver<S::Effect>>,
+
+    state_subscribers: Vec<UnboundedSender<S>>,
+
+    stop_sender: Sender<()>,
+    stop_receiver: Option<Receiver<()>>,
 }
 
-impl<S: State + Clone + Copy> Inu<S> {
+impl<S: State + Clone + Copy + Debug> Inu<S> {
+
+    /// Create a new `Inu` instance. Note that you need to `run` it to drive the futures / streams.
     pub fn new(initial_state: S) -> Inu<S> {
-        //let actions_channel = unbounded();
-        unimplemented!();
-        //Inu { actions_channel, state: initial_state }
+        let (action_sender, action_receiver) = unbounded();
+        let (effect_sender, effect_receiver) = unbounded();
+        let (stop_sender, stop_receiver) = channel(1);
+
+        Inu {
+            state: Arc::new(Mutex::new(initial_state)),
+            action_sender,
+            action_receiver: Some(action_receiver),
+            effect_sender,
+            effect_receiver: Some(effect_receiver),
+            state_subscribers: Vec::new(),
+            stop_sender,
+            stop_receiver: Some(stop_receiver),
+        }
     }
 
-    pub async fn subscribe_actions() {}
-    pub async fn subscribe_effects() {}
+    /// Get a `Handle` that can be used to stop the instance.
+    pub fn get_handle(&mut self) -> Handle {
+        let stopper = self.stop_sender.clone();
+        Handle { stopper }
+    }
 
+    /// Get the current `State`
+    pub async fn get_state(&mut self) -> S {
+        self.state.lock().await.clone()
+    }
+
+    /// Subscribe to changes to `State`
+    pub fn subscribe(&mut self) -> UnboundedReceiver<S> {
+        let (sender, receiver) = unbounded();
+        self.state_subscribers.push(sender);
+
+        receiver
+    }
+
+    /// Run the `Inu` instance
     pub async fn run(&mut self) {
         let action_receiver = self.action_receiver.take().unwrap();
         let effect_receiver = self.effect_receiver.take().unwrap();
-        let initial_state = self.initial_state.clone();
+        let stop_receiver = self.stop_receiver.take().unwrap();
 
-        action_receiver
+        let action_sender = self.action_sender.clone();
+        let effect_sender = self.effect_sender.clone();
+
+        let stopper_stream = stop_receiver
+            .take(1)
+            .map(|_| (action_sender.clone(), effect_sender.clone()))
+            .for_each(|(action_sender, effect_sender)| async move {
+                action_sender.close_channel();
+                effect_sender.close_channel();
+            });
+
+        let actions_stream = action_receiver
             .map(|action| (action, &self.state_subscribers, self.state.clone()))
             .for_each(|(action, state_subscribers, state)| async move {
                 {
                     let mut mutable_state = state.lock().await;
-                    *mutable_state = initial_state.apply_action(&action);
+                    *mutable_state = mutable_state.apply_action(&action);
                 }
 
                 // Send the new state to all the state subscribers
                 futures::stream::iter(state_subscribers)
-                    .map(|action_subscriber| (action_subscriber, state.clone()))
-                    .for_each(|(mut action_subscriber, state)| async move {
-                        let current_state = state.lock().await;
-                        action_subscriber.send(current_state.clone()).await.unwrap();
+                    .map(|state_subscriber| (state_subscriber, state.clone()))
+                    .for_each(|(mut state_subscriber, state)| async move {
+                        let current_state = state.lock().await.clone();
+                        state_subscriber.send(current_state).await.unwrap();
                     })
                     .await;
-            })
-            .await;
+            });
 
-        effect_receiver
+        let effects_stream = effect_receiver
             .map(|effect| (effect, self.action_sender.clone(), self.state.clone()))
-            .for_each(|(effect, action_sender, state)| async move {
+            .for_each_concurrent(None, |(effect, action_sender, state)| async move {
                 let state = state.lock().await;
                 let actions_stream = state.apply_effect(&effect);
 
                 actions_stream
-                    .map(|action|(action, action_sender.clone()))
-                    .for_each(|(action, mut action_sender)| async move { action_sender.send(action).await.unwrap(); }).await
-            }).await;
+                    .map(|action| (action, action_sender.clone()))
+                    .for_each_concurrent(None, |(action, mut action_sender)| async move {
+                        action_sender.send(action).await.unwrap();
+                    })
+                    .await
+            });
+
+        futures::join! {actions_stream, effects_stream, stopper_stream};
     }
 
+    /// Dispatch `State::Action`s or `State::Effect`s
     pub async fn dispatch(
         &mut self,
         action: Option<S::Action>,
@@ -97,8 +225,67 @@ impl<S: State + Clone + Copy> Inu<S> {
 
 #[cfg(test)]
 mod tests {
+    use crate::*;
+
+    use async_std::{stream::interval, task::block_on};
+    use futures::{FutureExt, StreamExt};
+    use std::time::Duration;
+
+    #[derive(Copy, Clone, Debug)]
+    struct MyState {
+        count: i32,
+    }
+
+    enum MyActions {
+        TimerTicked,
+    }
+
+    enum MyEffects {
+        ScheduleTick(u64),
+    }
+
+    impl State for MyState {
+        type Action = MyActions;
+        type Effect = MyEffects;
+
+        fn apply_action(&self, action: &Self::Action) -> Self {
+            match action {
+                MyActions::TimerTicked => MyState {
+                    count: self.count + 1,
+                },
+            }
+        }
+        fn apply_effect(&self, effect: &Self::Effect) -> Pin<Box<dyn Stream<Item = Self::Action>>> {
+            match effect {
+                MyEffects::ScheduleTick(tick_interval) => {
+                    let interval = interval(Duration::from_millis(*tick_interval));
+                    let stream = interval.take(2).map(|_| MyActions::TimerTicked);
+                    Box::pin(stream)
+                }
+            }
+        }
+    }
+
     #[test]
     fn it_works() {
-        assert_eq!(2 + 2, 4);
+        block_on(async {
+            let initial_state = MyState { count: 0 };
+            let mut inu = Inu::new(initial_state);
+            let inu_handle = inu.get_handle();
+
+            let stopped = inu
+                .subscribe()
+                .take_while(|state| futures::future::ready(state.count < 2))
+                .into_future()
+                .then(|_| async { inu_handle.stop().await.unwrap() });
+
+            inu.dispatch(None, Some(MyEffects::ScheduleTick(1)))
+                .await
+                .unwrap();
+
+            futures::join! {inu.run(), stopped };
+
+            assert_eq!(inu.get_state().await.count, 2);
+        });
     }
 }
