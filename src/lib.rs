@@ -313,11 +313,12 @@ mod tests {
                 .into_future()
                 .then(|_| async { inu_handle.stop().await.unwrap() });
 
+
+            futures::join! {inu.run(), stopped };
+
             inu.dispatch(None, Some(MyEffects::ScheduleTick(5)))
                 .await
                 .unwrap();
-
-            futures::join! {inu.run(), stopped };
 
             assert_eq!(inu.get_state().await.count, 2);
         });
