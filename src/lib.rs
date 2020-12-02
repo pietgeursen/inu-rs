@@ -5,7 +5,7 @@
 //! ```
 //!    use inu_rs::*;
 //!
-//!    use async_std::{stream::interval, task::block_on};
+//!    use async_std::{stream::interval, task::{block_on, spawn}};
 //!    use futures::{FutureExt, Stream, StreamExt};
 //!    use std::time::Duration;
 //!    use std::pin::Pin;
@@ -15,12 +15,12 @@
 //!        count: i32,
 //!    }
 //!
-//!    #[derive(Debug)]
+//!    #[derive(Debug, Clone)]
 //!    enum MyActions {
 //!        TimerTicked,
 //!    }
 //!
-//!    #[derive(Debug)]
+//!    #[derive(Debug, Clone)]
 //!    enum MyEffects {
 //!        ScheduleTick(u64),
 //!    }
@@ -58,10 +58,14 @@
 //!                .into_future()
 //!                .then(|_| async { inu_handle.stop().await.unwrap() });
 //!
-//!            inu.dispatch(None, Some(MyEffects::ScheduleTick(1)))
-//!                .await
-//!                .unwrap();
-//!
+//!            let mut inu_handle = inu.get_handle();
+//!            // You can dispatch actions and effects asynchronously from other tasks using the
+//!            // handle.
+//!            spawn(async move {
+//!                 inu_handle.dispatch(None, Some(MyEffects::ScheduleTick(1)))
+//!                     .await
+//!                     .unwrap();
+//!            });
 //!
 //!            futures::join! {inu.run(), stopped };
 //!
@@ -125,9 +129,11 @@ impl<S: State + Clone + Copy + Debug> Inu<S> {
     }
 
     /// Get a `Handle` that can be used to stop the instance.
-    pub fn get_handle(&mut self) -> Handle {
+    pub fn get_handle(&mut self) -> Handle<S> {
         let stopper = self.stop_sender.clone();
-        Handle { stopper }
+        let action_sender = self.action_sender.clone();
+        let effect_sender = self.effect_sender.clone();
+        Handle::new(stopper, action_sender, effect_sender)
     }
 
     /// Get the current `State`
@@ -141,21 +147,6 @@ impl<S: State + Clone + Copy + Debug> Inu<S> {
         let state_sender = StateSender::new(sender);
         self.state_subscribers.lock().await.insert(state_sender);
         receiver
-    }
-
-    /// Dispatch `State::Action`s and / or `State::Effect`s
-    pub async fn dispatch(
-        &mut self,
-        action: Option<S::Action>,
-        effect: Option<S::Effect>,
-    ) -> Result<(), SendError> {
-        if let Some(action) = action {
-            self.action_sender.send(action).await?
-        }
-        if let Some(effect) = effect {
-            self.effect_sender.send(effect).await?
-        }
-        Ok(())
     }
 
     /// Run the `Inu` instance
@@ -251,7 +242,10 @@ impl<S: State + Clone + Copy + Debug> Inu<S> {
 mod tests {
     use crate::*;
 
-    use async_std::{stream::interval, task::block_on};
+    use async_std::{
+        stream::interval,
+        task::{block_on, spawn},
+    };
     use futures::{stream::once, FutureExt, Stream, StreamExt};
     use std::pin::Pin;
     use std::time::Duration;
@@ -262,13 +256,13 @@ mod tests {
         a_bool: bool,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     enum MyActions {
         TimerTicked,
         SetBool,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     enum MyEffects {
         ScheduleTick(u64),
         ScheduleSetBool,
@@ -304,21 +298,24 @@ mod tests {
                 a_bool: false,
             };
             let mut inu = Inu::new(initial_state);
-            let inu_handle = inu.get_handle();
+            let mut inu_handle = inu.get_handle();
+            let handle = inu.get_handle();
+
+            spawn(async move {
+                inu_handle
+                    .dispatch(None, Some(MyEffects::ScheduleTick(5)))
+                    .await
+                    .unwrap();
+            });
 
             let stopped = inu
                 .subscribe()
                 .await
                 .filter(|state| futures::future::ready(state.count >= 2))
                 .into_future()
-                .then(|_| async { inu_handle.stop().await.unwrap() });
-
+                .then(|_| async { handle.stop().await.unwrap() });
 
             futures::join! {inu.run(), stopped };
-
-            inu.dispatch(None, Some(MyEffects::ScheduleTick(5)))
-                .await
-                .unwrap();
 
             assert_eq!(inu.get_state().await.count, 2);
         });
@@ -332,18 +329,22 @@ mod tests {
                 a_bool: false,
             };
             let mut inu = Inu::new(initial_state);
-            let inu_handle = inu.get_handle();
+            let mut inu_handle = inu.get_handle();
+            let handle = inu_handle.clone();
+
+            spawn(async move {
+                inu_handle
+                    .dispatch(None, Some(MyEffects::ScheduleTick(5)))
+                    .await
+                    .unwrap();
+            });
 
             let stopped = inu
                 .subscribe()
                 .await
                 .filter(|state| futures::future::ready(state.count >= 2))
                 .into_future()
-                .then(|_| async { inu_handle.stop().await.unwrap() });
-
-            inu.dispatch(None, Some(MyEffects::ScheduleTick(1)))
-                .await
-                .unwrap();
+                .then(|_| async { handle.stop().await.unwrap() });
 
             // create a subscriber and close it immediately.
             inu.subscribe().await.close();
@@ -362,23 +363,27 @@ mod tests {
                 a_bool: false,
             };
             let mut inu = Inu::new(initial_state);
-            let inu_handle = inu.get_handle();
+            let mut inu_handle = inu.get_handle();
+            let handle = inu_handle.clone();
+
+            spawn(async move {
+                inu_handle
+                    .dispatch(None, Some(MyEffects::ScheduleTick(5)))
+                    .await
+                    .unwrap();
+
+                inu_handle
+                    .dispatch(None, Some(MyEffects::ScheduleSetBool))
+                    .await
+                    .unwrap();
+            });
 
             let stopped = inu
                 .subscribe()
                 .await
                 .filter(|state| futures::future::ready(state.a_bool))
                 .into_future()
-                .then(|_| async move { inu_handle.stop().await.unwrap() });
-
-            // Dispatch the this one first, but it takes longer to dispatch an action
-            inu.dispatch(None, Some(MyEffects::ScheduleTick(5)))
-                .await
-                .unwrap();
-
-            inu.dispatch(None, Some(MyEffects::ScheduleSetBool))
-                .await
-                .unwrap();
+                .then(|_| async move { handle.stop().await.unwrap() });
 
             futures::join! {inu.run(), stopped };
 
