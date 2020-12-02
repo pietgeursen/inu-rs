@@ -1,5 +1,4 @@
-//! # inu-rs
-//! > [inu](https://github.com/ahdinosaur/inu) reduxy state manager in rust
+//! > A redux-like state manager based on [inu](https://github.com/ahdinosaur/inu).
 //!
 //! ## Example
 //!
@@ -70,8 +69,8 @@
 //!    }
 //! ```
 //!
-pub use futures::channel::mpsc::{Sender, Receiver, UnboundedReceiver, SendError};
 use futures::channel::mpsc::{channel, unbounded, UnboundedSender};
+pub use futures::channel::mpsc::{Receiver, SendError, Sender, UnboundedReceiver};
 use futures::lock::Mutex;
 use futures::Stream;
 use futures::{SinkExt, StreamExt};
@@ -79,7 +78,7 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// Implement this trait for your applications's state.  
+/// Implement this trait for your application's state.  
 pub trait State {
     type Action;
     type Effect;
@@ -100,7 +99,7 @@ impl Handle {
     }
 }
 
-/// The `Inu` state manager. 
+/// The `Inu` state manager.
 pub struct Inu<S: State> {
     state: Arc<Mutex<S>>,
 
@@ -117,8 +116,8 @@ pub struct Inu<S: State> {
 }
 
 impl<S: State + Clone + Copy + Debug> Inu<S> {
-
-    /// Create a new `Inu` instance. Note that you need to `run` it to drive the futures / streams.
+    /// Create a new `Inu` instance. Note that you need to `run` it to drive the futures / streams
+    /// to completion.
     pub fn new(initial_state: S) -> Inu<S> {
         let (action_sender, action_receiver) = unbounded();
         let (effect_sender, effect_receiver) = unbounded();
@@ -288,4 +287,9 @@ mod tests {
             assert_eq!(inu.get_state().await.count, 2);
         });
     }
+    #[test]
+    fn subscribers_can_unsubscribe(){}
+
+    #[test]
+    fn effects_resolve_concurrently(){}
 }
