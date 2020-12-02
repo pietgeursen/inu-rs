@@ -15,10 +15,12 @@
 //!        count: i32,
 //!    }
 //!
+//!    #[derive(Debug)]
 //!    enum MyActions {
 //!        TimerTicked,
 //!    }
 //!
+//!    #[derive(Debug)]
 //!    enum MyEffects {
 //!        ScheduleTick(u64),
 //!    }
@@ -52,7 +54,7 @@
 //!            let stopped = inu
 //!                .subscribe()
 //!                .await
-//!                .take_while(|state| futures::future::ready(state.count < 2))
+//!                .filter(|state| futures::future::ready(state.count >= 2))
 //!                .into_future()
 //!                .then(|_| async { inu_handle.stop().await.unwrap() });
 //!
@@ -145,9 +147,6 @@ impl<S: State + Clone + Copy + Debug> Inu<S> {
         let effect_receiver = self.effect_receiver.take().unwrap();
         let stop_receiver = self.stop_receiver.take().unwrap();
 
-        let action_sender = self.action_sender.clone();
-        let effect_sender = self.effect_sender.clone();
-
         let (unsubscribe_sender, unsubscribe_receiver) = unbounded::<StateSender<S>>();
 
         let unsubscribe_stream = unsubscribe_receiver
@@ -158,20 +157,7 @@ impl<S: State + Clone + Copy + Debug> Inu<S> {
 
         let stopper_stream = stop_receiver
             .take(1)
-            .map(|_| {
-                (
-                    action_sender.clone(),
-                    effect_sender.clone(),
-                    unsubscribe_sender.clone(),
-                )
-            })
-            .for_each(
-                |(action_sender, effect_sender, unsubscribe_sender)| async move {
-                    action_sender.close_channel();
-                    effect_sender.close_channel();
-                    unsubscribe_sender.close_channel();
-                },
-            );
+            .into_future();
 
         let actions_stream = action_receiver
             .map(|action| {
@@ -219,6 +205,10 @@ impl<S: State + Clone + Copy + Debug> Inu<S> {
                 let state = state.lock().await;
                 let actions_stream = state.apply_effect(&effect);
 
+                // This is important! We need to free up the lock on the state mutex now we're done
+                // with it.
+                drop(state);
+
                 actions_stream
                     .map(|action| (action, action_sender.clone()))
                     .for_each_concurrent(None, |(action, mut action_sender)| async move {
@@ -227,7 +217,12 @@ impl<S: State + Clone + Copy + Debug> Inu<S> {
                     .await
             });
 
-        futures::join! {actions_stream, effects_stream, stopper_stream, unsubscribe_stream};
+        futures::select! {
+            _ = Box::pin(stopper_stream) => (),
+            _ = Box::pin(actions_stream) => (),
+            _ = Box::pin(effects_stream) => (),
+            _ = Box::pin(unsubscribe_stream) => ()
+        };
     }
 
     /// Dispatch `State::Action`s and / or `State::Effect`s
@@ -251,21 +246,26 @@ mod tests {
     use crate::*;
 
     use async_std::{stream::interval, task::block_on};
-    use futures::{FutureExt, Stream, StreamExt};
+    use futures::{stream::once, FutureExt, Stream, StreamExt};
     use std::pin::Pin;
     use std::time::Duration;
 
     #[derive(Copy, Clone, Debug)]
     struct MyState {
         count: i32,
+        a_bool: bool,
     }
 
+    #[derive(Debug)]
     enum MyActions {
         TimerTicked,
+        SetBool,
     }
 
+    #[derive(Debug)]
     enum MyEffects {
         ScheduleTick(u64),
+        ScheduleSetBool,
     }
 
     impl State for MyState {
@@ -275,15 +275,17 @@ mod tests {
         fn apply_action(&mut self, action: &Self::Action) {
             match action {
                 MyActions::TimerTicked => self.count = self.count + 1,
+                MyActions::SetBool => self.a_bool = true,
             }
         }
         fn apply_effect(&self, effect: &Self::Effect) -> Pin<Box<dyn Stream<Item = Self::Action>>> {
             match effect {
                 MyEffects::ScheduleTick(tick_interval) => {
                     let interval = interval(Duration::from_millis(*tick_interval));
-                    let stream = interval.take(2).map(|_| MyActions::TimerTicked);
+                    let stream = interval.take(5).map(|_| MyActions::TimerTicked);
                     Box::pin(stream)
                 }
+                MyEffects::ScheduleSetBool => Box::pin(once(async { MyActions::SetBool })),
             }
         }
     }
@@ -291,18 +293,21 @@ mod tests {
     #[test]
     fn it_works() {
         block_on(async {
-            let initial_state = MyState { count: 0 };
+            let initial_state = MyState {
+                count: 0,
+                a_bool: false,
+            };
             let mut inu = Inu::new(initial_state);
             let inu_handle = inu.get_handle();
 
             let stopped = inu
                 .subscribe()
                 .await
-                .take_while(|state| futures::future::ready(state.count < 2))
+                .filter(|state| futures::future::ready(state.count >= 2))
                 .into_future()
                 .then(|_| async { inu_handle.stop().await.unwrap() });
 
-            inu.dispatch(None, Some(MyEffects::ScheduleTick(1)))
+            inu.dispatch(None, Some(MyEffects::ScheduleTick(5)))
                 .await
                 .unwrap();
 
@@ -314,14 +319,17 @@ mod tests {
     #[test]
     fn subscribers_can_unsubscribe() {
         block_on(async {
-            let initial_state = MyState { count: 0 };
+            let initial_state = MyState {
+                count: 0,
+                a_bool: false,
+            };
             let mut inu = Inu::new(initial_state);
             let inu_handle = inu.get_handle();
 
             let stopped = inu
                 .subscribe()
                 .await
-                .take_while(|state| futures::future::ready(state.count < 2))
+                .filter(|state| futures::future::ready(state.count >= 2))
                 .into_future()
                 .then(|_| async { inu_handle.stop().await.unwrap() });
 
@@ -339,5 +347,37 @@ mod tests {
     }
 
     #[test]
-    fn effects_resolve_concurrently() {}
+    fn effects_resolve_concurrently() {
+        block_on(async {
+            let initial_state = MyState {
+                count: 0,
+                a_bool: false,
+            };
+            let mut inu = Inu::new(initial_state);
+            let inu_handle = inu.get_handle();
+
+            let stopped = inu
+                .subscribe()
+                .await
+                .filter(|state| futures::future::ready(state.a_bool))
+                .into_future()
+                .then(|_| async move { 
+                    inu_handle.stop().await.unwrap() 
+                });
+
+            // Dispatch the this one first, but it takes longer to dispatch an action
+            inu.dispatch(None, Some(MyEffects::ScheduleTick(5)))
+                .await
+                .unwrap();
+
+            inu.dispatch(None, Some(MyEffects::ScheduleSetBool))
+                .await
+                .unwrap();
+
+            futures::join! {inu.run(), stopped };
+
+            assert!(inu.get_state().await.a_bool);
+            assert_eq!(inu.get_state().await.count, 0);
+        });
+    }
 }
