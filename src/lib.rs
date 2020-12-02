@@ -73,9 +73,11 @@
 use futures::channel::mpsc::{channel, unbounded, UnboundedSender};
 pub use futures::channel::mpsc::{Receiver, SendError, Sender, UnboundedReceiver};
 use futures::lock::Mutex;
+use futures::Stream;
 use futures::{SinkExt, StreamExt};
 use std::collections::HashSet;
 use std::fmt::Debug;
+use std::pin::Pin;
 use std::sync::Arc;
 
 mod handle;
@@ -141,6 +143,21 @@ impl<S: State + Clone + Copy + Debug> Inu<S> {
         receiver
     }
 
+    /// Dispatch `State::Action`s and / or `State::Effect`s
+    pub async fn dispatch(
+        &mut self,
+        action: Option<S::Action>,
+        effect: Option<S::Effect>,
+    ) -> Result<(), SendError> {
+        if let Some(action) = action {
+            self.action_sender.send(action).await?
+        }
+        if let Some(effect) = effect {
+            self.effect_sender.send(effect).await?
+        }
+        Ok(())
+    }
+
     /// Run the `Inu` instance
     pub async fn run(&mut self) {
         let action_receiver = self.action_receiver.take().unwrap();
@@ -155,9 +172,7 @@ impl<S: State + Clone + Copy + Debug> Inu<S> {
                 subscribers.lock().await.remove(&unsubscriber);
             });
 
-        let stopper_stream = stop_receiver
-            .take(1)
-            .into_future();
+        let stopper_stream = stop_receiver.into_future();
 
         let actions_stream = action_receiver
             .map(|action| {
@@ -170,10 +185,7 @@ impl<S: State + Clone + Copy + Debug> Inu<S> {
             })
             .for_each(
                 |(action, state_subscribers, state, unsubscribe_sender)| async move {
-                    {
-                        let mut mutable_state = state.lock().await;
-                        mutable_state.apply_action(&action);
-                    }
+                    Self::update_state_from_action(state.clone(), &action).await;
 
                     let state_subscribers = state_subscribers.lock().await;
                     // Send the new state to all the state subscribers
@@ -202,12 +214,8 @@ impl<S: State + Clone + Copy + Debug> Inu<S> {
         let effects_stream = effect_receiver
             .map(|effect| (effect, self.action_sender.clone(), self.state.clone()))
             .for_each_concurrent(None, |(effect, action_sender, state)| async move {
-                let state = state.lock().await;
-                let actions_stream = state.apply_effect(&effect);
-
-                // This is important! We need to free up the lock on the state mutex now we're done
-                // with it.
-                drop(state);
+                let actions_stream =
+                    Self::get_action_stream_from_effect(state.clone(), &effect).await;
 
                 actions_stream
                     .map(|action| (action, action_sender.clone()))
@@ -225,19 +233,17 @@ impl<S: State + Clone + Copy + Debug> Inu<S> {
         };
     }
 
-    /// Dispatch `State::Action`s and / or `State::Effect`s
-    pub async fn dispatch(
-        &mut self,
-        action: Option<S::Action>,
-        effect: Option<S::Effect>,
-    ) -> Result<(), SendError> {
-        if let Some(action) = action {
-            self.action_sender.send(action).await?
-        }
-        if let Some(effect) = effect {
-            self.effect_sender.send(effect).await?
-        }
-        Ok(())
+    async fn update_state_from_action(state: Arc<Mutex<S>>, action: &S::Action) {
+        let mut mutable_state = state.lock().await;
+        mutable_state.apply_action(&action);
+    }
+
+    async fn get_action_stream_from_effect(
+        state: Arc<Mutex<S>>,
+        effect: &S::Effect,
+    ) -> Pin<Box<dyn Stream<Item = S::Action>>> {
+        let state = state.lock().await;
+        state.apply_effect(&effect)
     }
 }
 
@@ -316,6 +322,7 @@ mod tests {
             assert_eq!(inu.get_state().await.count, 2);
         });
     }
+
     #[test]
     fn subscribers_can_unsubscribe() {
         block_on(async {
@@ -361,9 +368,7 @@ mod tests {
                 .await
                 .filter(|state| futures::future::ready(state.a_bool))
                 .into_future()
-                .then(|_| async move { 
-                    inu_handle.stop().await.unwrap() 
-                });
+                .then(|_| async move { inu_handle.stop().await.unwrap() });
 
             // Dispatch the this one first, but it takes longer to dispatch an action
             inu.dispatch(None, Some(MyEffects::ScheduleTick(5)))
