@@ -27,11 +27,9 @@
 //!        type Action = MyActions;
 //!        type Effect = MyEffects;
 //!
-//!        fn apply_action(&self, action: &Self::Action) -> Self {
+//!        fn apply_action(&mut self, action: &Self::Action) {
 //!            match action {
-//!                MyActions::TimerTicked => MyState {
-//!                    count: self.count + 1,
-//!                },
+//!                MyActions::TimerTicked => self.count = self.count + 1,
 //!            }
 //!        }
 //!        fn apply_effect(&self, effect: &Self::Effect) -> Pin<Box<dyn Stream<Item = Self::Action>>> {
@@ -83,7 +81,7 @@ pub trait State {
     type Action;
     type Effect;
 
-    fn apply_action(&self, action: &Self::Action) -> Self;
+    fn apply_action(&mut self, action: &Self::Action);
     fn apply_effect(&self, effect: &Self::Effect) -> Pin<Box<dyn Stream<Item = Self::Action>>>;
 }
 
@@ -176,7 +174,7 @@ impl<S: State + Clone + Copy + Debug> Inu<S> {
             .for_each(|(action, state_subscribers, state)| async move {
                 {
                     let mut mutable_state = state.lock().await;
-                    *mutable_state = mutable_state.apply_action(&action);
+                    mutable_state.apply_action(&action);
                 }
 
                 // Send the new state to all the state subscribers
@@ -247,11 +245,9 @@ mod tests {
         type Action = MyActions;
         type Effect = MyEffects;
 
-        fn apply_action(&self, action: &Self::Action) -> Self {
+        fn apply_action(&mut self, action: &Self::Action){
             match action {
-                MyActions::TimerTicked => MyState {
-                    count: self.count + 1,
-                },
+                MyActions::TimerTicked => self.count = self.count + 1,
             }
         }
         fn apply_effect(&self, effect: &Self::Effect) -> Pin<Box<dyn Stream<Item = Self::Action>>> {
