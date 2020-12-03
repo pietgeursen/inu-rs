@@ -108,7 +108,7 @@ pub struct Inu<S: State> {
     stop_receiver: Option<Receiver<()>>,
 }
 
-impl<S: State + Clone + Copy + Debug> Inu<S> {
+impl<S: State + Clone + Debug> Inu<S> {
     /// Create a new `Inu` instance. Note that you need to `run` it to drive the futures / streams
     /// to completion.
     pub fn new(initial_state: S) -> Inu<S> {
