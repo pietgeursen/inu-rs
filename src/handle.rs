@@ -1,6 +1,6 @@
 use crate::State;
 use futures::channel::mpsc::{SendError, Sender, UnboundedSender};
-use futures::channel::oneshot::{channel, Receiver as OneshotReceiver, Sender as OneshotSender};
+use futures::channel::oneshot::{channel, Sender as OneshotSender};
 use futures::prelude::*;
 
 /// The handle you can use to stop an `Inu`
