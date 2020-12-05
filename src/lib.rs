@@ -76,6 +76,7 @@
 //!
 use futures::channel::mpsc::{channel, unbounded, UnboundedSender};
 pub use futures::channel::mpsc::{Receiver, SendError, Sender, UnboundedReceiver};
+pub use futures::channel::oneshot::{Sender as OneshotSender, Receiver as OneshotReceiver};
 use futures::lock::Mutex;
 use futures::Stream;
 use futures::{SinkExt, StreamExt};
@@ -102,6 +103,9 @@ pub struct Inu<S: State> {
     effect_sender: UnboundedSender<S::Effect>,
     effect_receiver: Option<UnboundedReceiver<S::Effect>>,
 
+    get_state_sender: UnboundedSender<OneshotSender<S>>,
+    get_state_receiver: Option<UnboundedReceiver<OneshotSender<S>>>,
+
     state_subscribers: Arc<Mutex<HashSet<StateSender<S>>>>,
 
     stop_sender: Sender<()>,
@@ -114,6 +118,7 @@ impl<S: State + Clone + Debug> Inu<S> {
     pub fn new(initial_state: S) -> Inu<S> {
         let (action_sender, action_receiver) = unbounded();
         let (effect_sender, effect_receiver) = unbounded();
+        let (get_state_sender, get_state_receiver) = unbounded();
         let (stop_sender, stop_receiver) = channel(1);
 
         Inu {
@@ -125,6 +130,8 @@ impl<S: State + Clone + Debug> Inu<S> {
             state_subscribers: Arc::new(Mutex::new(HashSet::new())),
             stop_sender,
             stop_receiver: Some(stop_receiver),
+            get_state_sender,
+            get_state_receiver: Some(get_state_receiver)
         }
     }
 
@@ -133,7 +140,8 @@ impl<S: State + Clone + Debug> Inu<S> {
         let stopper = self.stop_sender.clone();
         let action_sender = self.action_sender.clone();
         let effect_sender = self.effect_sender.clone();
-        Handle::new(stopper, action_sender, effect_sender)
+        let get_state_sender = self.get_state_sender.clone();
+        Handle::new(stopper, action_sender, effect_sender, get_state_sender)
     }
 
     /// Get the current `State`
@@ -154,6 +162,7 @@ impl<S: State + Clone + Debug> Inu<S> {
         let action_receiver = self.action_receiver.take().unwrap();
         let effect_receiver = self.effect_receiver.take().unwrap();
         let stop_receiver = self.stop_receiver.take().unwrap();
+        let get_state_receiver = self.get_state_receiver.take().unwrap();
 
         let (unsubscribe_sender, unsubscribe_receiver) = unbounded::<StateSender<S>>();
 
@@ -164,6 +173,13 @@ impl<S: State + Clone + Debug> Inu<S> {
             });
 
         let stopper_stream = stop_receiver.into_future();
+
+        let get_state_stream = get_state_receiver
+            .map(|sender| (sender, self.state.clone()))
+            .for_each(|(sender, state)|async move {
+                let state = state.lock().await.clone();
+                sender.send(state).unwrap_or(());
+            });
 
         let actions_stream = action_receiver
             .map(|action| {
@@ -220,6 +236,7 @@ impl<S: State + Clone + Debug> Inu<S> {
             _ = Box::pin(stopper_stream) => (),
             _ = Box::pin(actions_stream) => (),
             _ = Box::pin(effects_stream) => (),
+            _ = Box::pin(get_state_stream) => (),
             _ = Box::pin(unsubscribe_stream) => ()
         };
     }
