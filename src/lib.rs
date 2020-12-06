@@ -34,11 +34,11 @@
 //!                MyActions::TimerTicked => self.count = self.count + 1,
 //!            }
 //!        }
-//!        fn apply_effect(&self, effect: &Self::Effect) -> Pin<Box<dyn Stream<Item = Self::Action>>> {
+//!        fn apply_effect(&self, effect: &Self::Effect) -> Pin<Box<dyn Stream<Item = Option<Self::Action>>>> {
 //!            match effect {
 //!                MyEffects::ScheduleTick(tick_interval) => {
 //!                    let interval = interval(Duration::from_millis(*tick_interval));
-//!                    let stream = interval.take(2).map(|_| MyActions::TimerTicked);
+//!                    let stream = interval.take(2).map(|_| Some(MyActions::TimerTicked));
 //!                    Box::pin(stream)
 //!                }
 //!            }
@@ -76,7 +76,7 @@
 //!
 use futures::channel::mpsc::{channel, unbounded, UnboundedSender};
 pub use futures::channel::mpsc::{Receiver, SendError, Sender, UnboundedReceiver};
-pub use futures::channel::oneshot::{Sender as OneshotSender, Receiver as OneshotReceiver};
+pub use futures::channel::oneshot::{Receiver as OneshotReceiver, Sender as OneshotSender};
 use futures::lock::Mutex;
 use futures::Stream;
 use futures::{SinkExt, StreamExt};
@@ -107,6 +107,7 @@ pub struct Inu<S: State> {
     get_state_receiver: Option<UnboundedReceiver<OneshotSender<S>>>,
 
     state_subscribers: Arc<Mutex<HashSet<StateSender<S>>>>,
+    state_subscriber_monotonic_counter: usize,
 
     stop_sender: Sender<()>,
     stop_receiver: Option<Receiver<()>>,
@@ -128,10 +129,11 @@ impl<S: State + Clone + Debug> Inu<S> {
             effect_sender,
             effect_receiver: Some(effect_receiver),
             state_subscribers: Arc::new(Mutex::new(HashSet::new())),
+            state_subscriber_monotonic_counter: 0,
             stop_sender,
             stop_receiver: Some(stop_receiver),
             get_state_sender,
-            get_state_receiver: Some(get_state_receiver)
+            get_state_receiver: Some(get_state_receiver),
         }
     }
 
@@ -152,7 +154,8 @@ impl<S: State + Clone + Debug> Inu<S> {
     /// Subscribe to changes to `State`
     pub async fn subscribe(&mut self) -> UnboundedReceiver<S> {
         let (sender, receiver) = unbounded();
-        let state_sender = StateSender::new(sender);
+        let state_sender = StateSender::new(sender, self.state_subscriber_monotonic_counter);
+        self.state_subscriber_monotonic_counter += 1;
         self.state_subscribers.lock().await.insert(state_sender);
         receiver
     }
@@ -176,7 +179,7 @@ impl<S: State + Clone + Debug> Inu<S> {
 
         let get_state_stream = get_state_receiver
             .map(|sender| (sender, self.state.clone()))
-            .for_each(|(sender, state)|async move {
+            .for_each(|(sender, state)| async move {
                 let state = state.lock().await.clone();
                 sender.send(state).unwrap_or(());
             });
@@ -225,7 +228,7 @@ impl<S: State + Clone + Debug> Inu<S> {
                     Self::get_action_stream_from_effect(state.clone(), &effect).await;
 
                 actions_stream
-                    .filter_map(|action| async {action})
+                    .filter_map(|action| async { action })
                     .map(|action| (action, action_sender.clone()))
                     .for_each_concurrent(None, |(action, mut action_sender)| async move {
                         action_sender.send(action).await.unwrap();
@@ -296,14 +299,17 @@ mod tests {
                 MyActions::SetBool => self.a_bool = true,
             }
         }
-        fn apply_effect(&self, effect: &Self::Effect) -> Pin<Box<dyn Stream<Item = Self::Action>>> {
+        fn apply_effect(
+            &self,
+            effect: &Self::Effect,
+        ) -> Pin<Box<dyn Stream<Item = Option<Self::Action>>>> {
             match effect {
                 MyEffects::ScheduleTick(tick_interval) => {
                     let interval = interval(Duration::from_millis(*tick_interval));
-                    let stream = interval.take(5).map(|_| MyActions::TimerTicked);
+                    let stream = interval.take(5).map(|_| Some(MyActions::TimerTicked));
                     Box::pin(stream)
                 }
-                MyEffects::ScheduleSetBool => Box::pin(once(async { MyActions::SetBool })),
+                MyEffects::ScheduleSetBool => Box::pin(once(async { Some(MyActions::SetBool) })),
             }
         }
     }
