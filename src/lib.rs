@@ -225,6 +225,7 @@ impl<S: State + Clone + Debug> Inu<S> {
                     Self::get_action_stream_from_effect(state.clone(), &effect).await;
 
                 actions_stream
+                    .filter_map(|action| async {action})
                     .map(|action| (action, action_sender.clone()))
                     .for_each_concurrent(None, |(action, mut action_sender)| async move {
                         action_sender.send(action).await.unwrap();
@@ -249,7 +250,7 @@ impl<S: State + Clone + Debug> Inu<S> {
     async fn get_action_stream_from_effect(
         state: Arc<Mutex<S>>,
         effect: &S::Effect,
-    ) -> Pin<Box<dyn Stream<Item = S::Action>>> {
+    ) -> Pin<Box<dyn Stream<Item = Option<S::Action>>>> {
         let state = state.lock().await;
         state.apply_effect(&effect)
     }

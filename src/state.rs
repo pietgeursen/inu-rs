@@ -8,5 +8,5 @@ pub trait State {
     type Effect: Debug;
 
     fn apply_action(&mut self, action: &Self::Action);
-    fn apply_effect(&self, effect: &Self::Effect) -> Pin<Box<dyn Stream<Item = Self::Action>>>;
+    fn apply_effect(&self, effect: &Self::Effect) -> Pin<Box<dyn Stream<Item = Option<Self::Action>>>>;
 }
