@@ -1,4 +1,4 @@
-name: Rust
+name: Build Docs
 
 on:
   push:
@@ -17,8 +17,8 @@ jobs:
     - name: Build docs
       run: cargo doc
 
-    - name: Deploy
+    - name: Deploy docs to gh pages
       uses: peaceiris/actions-gh-pages@v3
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
-        publish_dir: ./target/docs
+        publish_dir: ./target/doc
