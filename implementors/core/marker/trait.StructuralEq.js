@@ -1,0 +1,5 @@
+(function() {var implementors = {};
+implementors["futures_channel"] = [{"text":"impl StructuralEq for SendError","synthetic":false,"types":[]},{"text":"impl&lt;T&gt; StructuralEq for TrySendError&lt;T&gt;","synthetic":false,"types":[]},{"text":"impl StructuralEq for Canceled","synthetic":false,"types":[]}];
+implementors["futures_util"] = [{"text":"impl StructuralEq for Aborted","synthetic":false,"types":[]},{"text":"impl&lt;T&gt; StructuralEq for AllowStdIo&lt;T&gt;","synthetic":false,"types":[]}];
+implementors["proc_macro2"] = [{"text":"impl StructuralEq for Delimiter","synthetic":false,"types":[]},{"text":"impl StructuralEq for Spacing","synthetic":false,"types":[]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()
